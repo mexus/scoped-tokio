@@ -2,7 +2,7 @@
 //! [![crates.io](https://img.shields.io/crates/v/scoped-tokio.svg)](https://crates.io/crates/scoped-tokio)
 //! [![docs.rs](https://docs.rs/scoped-tokio/badge.svg)](https://docs.rs/scoped-tokio)
 //!
-//! [Master docs](https://mexus.github.io/scoped-tokio/scoped-tokio/index.html)!
+//! [Master docs](https://mexus.github.io/scoped-tokio/scoped_tokio/index.html)
 //!
 //! Scoped tokio runtime.
 //!
