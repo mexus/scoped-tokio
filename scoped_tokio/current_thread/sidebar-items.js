@@ -1,0 +1,1 @@
+initSidebarItems({"fn":[["scoped","Creates a scope for futures execution."]],"struct":[["Scope","Limited execution scope."]],"type":[["LocalBoxFuture","Boxed (and pinned) future without a `Send` requirement."]]});
