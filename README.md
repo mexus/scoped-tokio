@@ -47,7 +47,7 @@ fn run(counter: &mut usize) -> usize {
         string = "Hmpf...".into();
         s.spawn(set_string(&mut string));
 
-        // // The following line won't compile since `string` is mutable borrowed.
+        // // The following line won't compile since `string` is mutably borrowed.
         // string = "Race?".into();
 
         async { 10 }
