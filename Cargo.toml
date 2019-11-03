@@ -1,0 +1,18 @@
+[package]
+name = "scoped-tokio"
+version = "0.1.0"
+authors = ["mexus <gilaldpellaeon@gmail.com>"]
+edition = "2018"
+description = "Scoped tokio executors"
+readme = "README.md"
+license = "MIT/Apache-2.0"
+keywords = ["futures", "tokio", "scoped"]
+documentation = "https://docs.rs/scoped-tokio/"
+repository = "https://github.com/mexus/scoped-tokio"
+homepage = "https://github.com/mexus/scoped-tokio"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version =  "=0.2.0-alpha.6", default-features = false, features = [ 'rt-full' ] }
+futures-core-preview = "=0.3.0-alpha.19"
