@@ -10,30 +10,48 @@
 //! but enabling you to spawn non-static futures on executor, like the following:
 //!
 //! ```rust
-//! use scoped_tokio::threadpool::scoped;
+//! use scoped_tokio::threadpool::{scoped, Scope};
 //! # use std::future::Future;
 //!
-//! async fn increase1(counter: &mut usize) {
+//! fn increase1(counter: &mut usize) -> impl Future<Output = ()> + '_ {
 //!     *counter += 1;
+//!     async {}
 //! }
 //!
-//! fn increase2(counter: &mut usize) -> impl Future<Output = ()> + '_ {
-//!     *counter += 2;
-//!     async {}
+//! // Unfortunately, this lifetime handling stuff is too complicated for async-await generators, so
+//! // `async fn` can not be used here.
+//! fn increase2<'env, 'cnt>(
+//!     scope: &Scope<'env>,
+//!     counter: &'cnt mut usize,
+//! ) -> impl Future<Output = ()> + 'cnt
+//! where
+//!     'cnt: 'env,
+//! {
+//!     scope.spawn(async move {
+//!         *counter += 2;
+//!     });
+//!     async { () }
+//! }
+//!
+//! async fn set_string(s: &mut String) {
+//!     *s = "Hooray!".into();
 //! }
 //!
 //! fn run(counter: &mut usize) -> usize {
 //!     let mut counter2 = 0;
 //!     let mut string = String::new();
-//!     scoped(|s| {
+//!     let res = scoped(|s| {
 //!         s.spawn(increase1(counter));
-//!         s.spawn(increase2(&mut counter2));
+//!         s.spawn_ctx(|ctx| increase2(ctx, &mut counter2));
 //!         string = "Hmpf...".into();
-//!         s.spawn(async { string = "Hooray!".into() });
+//!         s.spawn(set_string(&mut string));
 //!
-//!         // The following line won't compile since `string` is mutable borrowed.
-//!         // string = "Hmpf...".into();
+//!         // // The following line won't compile since `string` is mutable borrowed.
+//!         // string = "Race?".into();
+//!
+//!         async { 10 }
 //!     });
+//!     assert_eq!(res, 10);
 //!     assert_eq!(string, "Hooray!");
 //!     counter2
 //! }
@@ -75,17 +93,19 @@ use std::pin::Pin;
 /// Current-threaded scoped executor.
 pub mod current_thread {
     use super::*;
+    use std::marker::PhantomData;
     use tokio::runtime::current_thread::{RunError, Runtime};
 
     /// Boxed (and pinned) future without a `Send` requirement.
     pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
     /// Limited execution scope.
-    pub struct Scope<'a> {
-        rt: &'a mut Runtime,
+    pub struct Scope<'scope> {
+        rt: Runtime,
+        _pd: PhantomData<&'scope mut ()>,
     }
 
-    impl<'a> Scope<'a> {
+    impl<'scope> Scope<'scope> {
         /// Spawns a future on the executor.
         ///
         /// Similar to [`tokio::runtime::current_thread::Runtime::spawn`], but doesn't require the
@@ -94,9 +114,10 @@ pub mod current_thread {
         /// # Notice
         ///
         /// The future is boxed before sending it to the executor!
-        pub fn spawn<F>(&mut self, f: F)
+        pub fn spawn<'local, F>(&'local mut self, f: F)
         where
-            F: Future<Output = ()> + 'a,
+            F: Future<Output = ()> + 'local,
+            'local: 'scope,
         {
             self.spawn_boxed(Box::pin(f))
         }
@@ -105,7 +126,10 @@ pub mod current_thread {
         ///
         /// Similar to [`tokio::runtime::current_thread::Runtime::spawn`], but doesn't require the
         /// future to be `'static`.
-        pub fn spawn_boxed(&mut self, f: LocalBoxFuture<'a, ()>) {
+        pub fn spawn_boxed<'local>(&'local mut self, f: LocalBoxFuture<'local, ()>)
+        where
+            'local: 'scope,
+        {
             // We guarantee that the future can not outlive the `scoped` call by triggering
             // `Runtime::run` explicitely at the end of the scope.
             let boxed: LocalBoxFuture<'static, ()> = unsafe { transmute(f) };
@@ -115,24 +139,27 @@ pub mod current_thread {
         /// Blocks on a future.
         ///
         /// Simply calls [`tokio::runtime::current_thread::Runtime::block_on`].
-        pub fn block_on<F>(&mut self, f: F) -> F::Output
+        pub fn block_on<'local, F>(&'local mut self, f: F) -> F::Output
         where
-            F: Future,
+            F: Future + 'local,
         {
             self.rt.block_on(f)
         }
     }
 
     /// Creates a scope for futures execution.
-    pub fn scoped<F>(f: F) -> Result<(), RunError>
+    pub fn scoped<'scope, F>(f: F) -> Result<(), RunError>
     where
-        F: FnOnce(&Scope),
+        for<'a> F: FnOnce(&'a mut Scope<'scope>),
     {
-        let mut rt = Runtime::new().expect("Can't build current-thread runtime");
-        let scope = Scope { rt: &mut rt };
-        f(&scope);
+        let rt = Runtime::new().expect("Can't build current-thread runtime");
+        let mut scope = Scope {
+            rt,
+            _pd: PhantomData,
+        };
+        f(&mut scope);
         // The safety happens here :)
-        rt.run()
+        scope.rt.run()
     }
 }
 
@@ -148,10 +175,27 @@ pub mod threadpool {
     /// Limited execution scope.
     pub struct Scope<'env> {
         rt: Runtime,
-        _pd: PhantomData<&'env ()>,
+        _pd: PhantomData<&'env mut &'env ()>,
     }
 
     impl<'env> Scope<'env> {
+        /// Spawns a future on the executor, providing a `Scope` as a context for creating the future.
+        ///
+        /// Similar to [`tokio::runtime::Runtime::spawn`], but doesn't require the future to be
+        /// `'static` and provides a reference to the current [`Scope`] as a closure argument.
+        ///
+        /// # Notice
+        ///
+        /// The future is boxed before sending it to the executor!
+        pub fn spawn_ctx<F, Fut>(&self, f: F)
+        where
+            F: FnOnce(&Scope<'env>) -> Fut + Send + 'env,
+            Fut: Future<Output = ()> + Send + 'env,
+        {
+            let fut = f(self);
+            self.spawn_boxed(Box::pin(fut))
+        }
+
         /// Spawns a future on the executor.
         ///
         /// Similar to [`tokio::runtime::Runtime::spawn`], but doesn't require the future to be
@@ -160,18 +204,31 @@ pub mod threadpool {
         /// # Notice
         ///
         /// The future is boxed before sending it to the executor!
-        pub fn spawn<F>(&mut self, f: F)
+        pub fn spawn<Fut>(&self, fut: Fut)
         where
-            F: Future<Output = ()> + Send + 'env,
+            Fut: Future<Output = ()> + Send + 'env,
         {
-            self.spawn_boxed(Box::pin(f))
+            self.spawn_boxed(Box::pin(fut))
+        }
+
+        /// Spawns a boxed future onto the executor, providing a `Scope` as a context for creating the future.
+        ///
+        /// Similar to [`tokio::runtime::Runtime::spawn`], but doesn't require the future to be
+        /// `'static` and provides a reference to the current [`Scope`] as a closure argument.
+        pub fn spawn_boxed_ctx<F>(&self, f: F)
+        where
+            F: FnOnce(&Scope<'env>) -> BoxFuture<'env, ()>,
+            F: Send + 'env,
+        {
+            let fut = f(self);
+            self.spawn_boxed(fut)
         }
 
         /// Spawns a boxed future onto the executor.
         ///
         /// Similar to [`tokio::runtime::Runtime::spawn`], but doesn't require the future to be
         /// `'static`.
-        pub fn spawn_boxed(&mut self, f: BoxFuture<'env, ()>) {
+        pub fn spawn_boxed(&self, f: BoxFuture<'env, ()>) {
             // We guarantee that the future can not outlive the `scoped` call by triggering
             // `Runtime::shutdown_on_idle` explicitely at the end of the scope.
             let boxed: BoxFuture<'static, ()> = unsafe { transmute(f) };
@@ -181,7 +238,7 @@ pub mod threadpool {
         /// Blocks on a future.
         ///
         /// Simply calls [`tokio::runtime::Runtime::block_on`].
-        pub fn block_on<F>(&mut self, f: F) -> F::Output
+        pub fn block_on<F>(&self, f: F) -> F::Output
         where
             F: Future,
         {
@@ -190,18 +247,21 @@ pub mod threadpool {
     }
 
     /// Creates a scope for futures execution.
-    pub fn scoped<'env, F>(f: F)
+    pub fn scoped<'env, F, Fut>(f: F) -> Fut::Output
     where
-        F: FnOnce(&mut Scope<'env>),
+        F: FnOnce(&Scope<'env>) -> Fut,
+        Fut: Future,
     {
         let rt = Runtime::new().expect("Can't build threadpool runtime");
-        let mut scope = Scope::<'env> {
+        let scope = Scope::<'env> {
             rt,
             _pd: PhantomData,
         };
-        f(&mut scope);
+        let fut = f(&scope);
         let rt = scope.rt;
+        let res = rt.block_on(fut);
         // The safety happens here :)
-        rt.shutdown_on_idle()
+        rt.shutdown_on_idle();
+        res
     }
 }
