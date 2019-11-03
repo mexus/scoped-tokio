@@ -100,12 +100,12 @@ pub mod current_thread {
     pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
     /// Limited execution scope.
-    pub struct Scope<'scope> {
+    pub struct Scope<'env> {
         rt: Runtime,
-        _pd: PhantomData<&'scope mut ()>,
+        _pd: PhantomData<&'env mut &'env ()>,
     }
 
-    impl<'scope> Scope<'scope> {
+    impl<'env> Scope<'env> {
         /// Spawns a future on the executor.
         ///
         /// Similar to [`tokio::runtime::current_thread::Runtime::spawn`], but doesn't require the
@@ -114,52 +114,83 @@ pub mod current_thread {
         /// # Notice
         ///
         /// The future is boxed before sending it to the executor!
-        pub fn spawn<'local, F>(&'local mut self, f: F)
+        pub fn spawn<F>(&mut self, f: F)
         where
-            F: Future<Output = ()> + 'local,
-            'local: 'scope,
+            F: Future<Output = ()> + 'env,
         {
             self.spawn_boxed(Box::pin(f))
         }
 
-        /// Spawns a future on the executor.
+        /// Spawns a future on the executor, providing a `Scope` as a context for creating the future.
+        ///
+        /// Similar to [`tokio::runtime::current_thread::Runtime::spawn`], but doesn't require the
+        /// future to be `'static` and provides a reference to the current [`Scope`] as a closure
+        /// argument.
+        ///
+        /// # Notice
+        ///
+        /// The future is boxed before sending it to the executor!
+        pub fn spawn_ctx<F, Fut>(&mut self, f: F)
+        where
+            F: FnOnce(&mut Scope<'env>) -> Fut + 'env,
+            Fut: Future<Output = ()> + 'env,
+        {
+            let fut = f(self);
+            self.spawn_boxed(Box::pin(fut))
+        }
+
+        /// Spawns a boxed future on the executor.
         ///
         /// Similar to [`tokio::runtime::current_thread::Runtime::spawn`], but doesn't require the
         /// future to be `'static`.
-        pub fn spawn_boxed<'local>(&'local mut self, f: LocalBoxFuture<'local, ()>)
-        where
-            'local: 'scope,
-        {
+        pub fn spawn_boxed(&mut self, f: LocalBoxFuture<'env, ()>) {
             // We guarantee that the future can not outlive the `scoped` call by triggering
             // `Runtime::run` explicitely at the end of the scope.
             let boxed: LocalBoxFuture<'static, ()> = unsafe { transmute(f) };
             self.rt.spawn(boxed);
         }
 
+        /// Spawns a boxed future on the executor, providing a `Scope` as a context for creating the
+        /// future.
+        ///
+        /// Similar to [`tokio::runtime::current_thread::Runtime::spawn`], but doesn't require the
+        /// future to be `'static` and provides a reference to the current [`Scope`] as a closure
+        /// argument.
+        pub fn spawn_boxed_ctx<F>(&mut self, f: F)
+        where
+            F: FnOnce(&mut Scope<'env>) -> LocalBoxFuture<'env, ()>,
+        {
+            let fut = f(self);
+            self.spawn_boxed(fut)
+        }
+
         /// Blocks on a future.
         ///
         /// Simply calls [`tokio::runtime::current_thread::Runtime::block_on`].
-        pub fn block_on<'local, F>(&'local mut self, f: F) -> F::Output
+        pub fn block_on<F>(&mut self, f: F) -> F::Output
         where
-            F: Future + 'local,
+            F: Future,
         {
             self.rt.block_on(f)
         }
     }
 
     /// Creates a scope for futures execution.
-    pub fn scoped<'scope, F>(f: F) -> Result<(), RunError>
+    pub fn scoped<'env, F, Fut>(f: F) -> Result<Fut::Output, RunError>
     where
-        for<'a> F: FnOnce(&'a mut Scope<'scope>),
+        F: FnOnce(&mut Scope<'env>) -> Fut,
+        Fut: Future,
     {
         let rt = Runtime::new().expect("Can't build current-thread runtime");
         let mut scope = Scope {
             rt,
             _pd: PhantomData,
         };
-        f(&mut scope);
+        let fut = f(&mut scope);
+        let res = scope.rt.block_on(fut);
         // The safety happens here :)
-        scope.rt.run()
+        scope.rt.run()?;
+        Ok(res)
     }
 }
 
